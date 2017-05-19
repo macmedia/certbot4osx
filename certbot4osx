@@ -1,0 +1,118 @@
+#!/bin/bash
+
+# ------------------------------------------------------------------
+# Mike Elser - 1.0.0 May 18th 2017 <mikeelser@gmail.com>
+# Original Script - cyrilpic <https://gist.githubusercontent.com/cyrilpic>
+# 
+#          
+# certbot4osx - Description
+#
+#   Script to automate certbot to run on Mac OS X
+#          
+#   Creates new letsencrypt.org certificates and
+#   installs cert into system keychain.
+#   -or-
+#   Renews excising certificates and updates the
+#   cert in the system keychain.
+#
+# Dependency:
+#     certbot -- https://certbot.eff.org
+# ------------------------------------------------------------------
+
+# CHANGE THIS
+PASS="**CHANGE_TO_SECURE_PASSWORD**"
+
+VERSION=1.0.0
+CERTBOT=/usr/local/bin/certbot
+PEM_PATH="/etc/letsencrypt/"
+LOG_FOLDER="/var/log/letsencrypt" 
+DATE=$(date +"%d-%m-%y")
+LOG_FILE="${LOG_FOLDER}/${DATE}.log" 
+ERR_MSG=''
+
+show_usage() {
+  echo
+  echo "certbot4osx $VERSION"
+  echo "--------------------"
+  echo "Usage: sudo certbot4osx renew|new|test [domain] [webroot]"
+  if [ ! -z "$ERR_MSG" ]; then
+    echo " │"
+    for e in "${ERR_MSG[@]::${#ERR_MSG[@]}-1}"; do
+      echo " ├ $e"
+    done
+    echo " └ ${ERR_MSG[@]: -1:1}"
+  fi
+  echo
+  exit 1
+}
+
+
+insert_into_keychain() {
+  openssl pkcs12 -export -inkey ${PEM_PATH}live/$1/privkey.pem -in ${PEM_PATH}live/$1/cert.pem -certfile ${PEM_PATH}live/$1/fullchain.pem -out ${PEM_PATH}live/$1/letsencrypt_sslcert.p12 -passout pass:${PASS}
+  SHA_NEW=`openssl pkcs12 -in  ${PEM_PATH}live/$1/letsencrypt_sslcert.p12 -nomacver -nodes -passin pass:${PASS} | openssl x509 -noout -fingerprint -sha1 | cut -f2 -d'=' | sed 's/://g'`
+  if [[ $2 != $SHA_NEW ]]; then
+    # New certificate available
+    
+    # Import into keychain
+    security import ${PEM_PATH}live/$1/letsencrypt_sslcert.p12 \
+     -f pkcs12 -k /Library/Keychains/System.keychain -P ${PASS} \
+     -T /Applications/Server.app/Contents/ServerRoot/System/Library/CoreServices/ServerManagerDaemon.bundle/Contents/MacOS/servermgrd
+    
+    # If we have the SHA value
+    if [ -n "$2" ]; then
+      # Tell services to use new certificate
+      certupdate replace -c /etc/certificates/$1.$2.cert.pem -C /etc/certificates/$1.$SHA_NEW.cert.pem
+      
+      # Delete old certificate
+      security delete-certificate -Z $2 -t /Library/Keychains/System.keychain
+    fi
+  fi
+}
+
+if [ "$EUID" -ne 0 ]; then 
+  echo "Must be run as root"
+  exit 1
+fi
+
+
+
+
+# Check that we have it installed
+if ! type "$CERTBOT" > /dev/null; then
+  echo "-> certbot not found!"
+  echo "-> Install using: brew install certbot"
+  exit 1
+fi
+
+if [ $PASS '==' "**CHANGE_TO_SECURE_PASSWORD**" ];then
+  echo "Change the password in this file before continuing!"
+  exit 1
+fi
+
+
+if [ "$1" '==' 'renew' ]; then
+  certbot renew --manual-public-ip-logging-ok --agree-tos > $LOG_FILE 2>&1
+  for D in `find ${PEM_PATH}live -mindepth 1 -type d -exec basename {} \;`
+  do
+      SHA=`openssl pkcs12 -in  ${PEM_PATH}live/$D/letsencrypt_sslcert.p12 -nomacver -nodes -passin pass:${PASS} | openssl x509 -noout -fingerprint -sha1 | cut -f2 -d'=' | sed 's/://g'`
+      insert_into_keychain $D $SHA
+  done
+elif [ "$1" '==' 'new' ]; then
+  
+  if [ $# -lt 3 ]; then
+    ERR_MSG[0]="Domain name is required for this function."
+    ERR_MSG[1]="Webroot is requited for this function."
+    show_usage
+  fi
+  certbot certonly --webroot -w $3 -d $2
+  insert_into_keychain $2
+
+elif [ "$1" '==' 'test' ]; then
+  if [ $# -lt 3 ]; then
+    ERR_MSG='Domain name and webroot are requires for this function.'
+    show_usage
+  fi
+ certbot certonly --test-cert --dry-run --webroot -w $3 -d $2
+else
+  show_usage
+fi
